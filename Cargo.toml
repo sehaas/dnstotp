@@ -10,6 +10,7 @@ async-trait = "0.1.63"
 chrono = "0.4.23"
 env_logger = "0.10.0"
 log = "0.4.17"
+microkv = "0.2.9"
 tokio = { version = "1.24.2", features = ["macros"] }
 totp-rs = { version = "4.2.0" }
 tracing = "0.1.37"

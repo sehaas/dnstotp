@@ -1,12 +1,10 @@
 use chrono::{Timelike, Utc};
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use microkv::{namespace::ExtendedIndexMap, MicroKV};
+use std::{collections::HashMap, path::PathBuf};
 
 use tokio::net::UdpSocket;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{error, info};
+use tracing::{debug, error, info, trace};
 use trust_dns_server::{
     authority::MessageResponseBuilder,
     client::rr::{Label, LowerName, Name},
@@ -19,15 +17,19 @@ use trust_dns_server::{
 };
 
 struct Handler {
-    otp_zone: LowerName,
-    tokens: Arc<RwLock<HashMap<String, TOTP>>>,
+    query_zone: LowerName,
+    new_zone: LowerName,
+    store: MicroKV,
 }
 
 impl Handler {
     pub fn new() -> Self {
         Handler {
-            otp_zone: LowerName::from(Name::from_ascii("otp.deebas.com").unwrap()),
-            tokens: Arc::new(RwLock::new(HashMap::new())),
+            query_zone: LowerName::from(Name::from_ascii("otp.deebas.com").unwrap()),
+            new_zone: LowerName::from(Name::from_ascii("new.otp.deebas.com").unwrap()),
+            store: MicroKV::open_with_base_path("dnstotp-db", PathBuf::from("./"))
+                .expect("no DB")
+                .set_auto_commit(true),
         }
     }
 
@@ -68,7 +70,7 @@ impl Handler {
         name.iter()
             .enumerate()
             .filter(|(i, n)| {
-                info!("label: {:?}", n);
+                trace!("label: {:?}", n);
                 i < &nr_labels
             })
             .fold(HashMap::new(), |mut m, (i, n)| {
@@ -84,23 +86,32 @@ impl Handler {
             return Err(String::from("wildcard"));
         }
 
-        if !self.otp_zone.zone_of(&LowerName::from(name)) {
+        if !self.query_zone.zone_of(&LowerName::from(name)) {
             return Err(String::from("wrong zone"));
         }
 
-        let nr_labels = (name.num_labels() - self.otp_zone.num_labels()) as usize;
+        let nr_labels = (name.num_labels() - self.query_zone.num_labels()) as usize;
 
-        info!("nr: {}", nr_labels);
+        debug!("nr: {}", nr_labels);
         match nr_labels {
             nr if nr == 1 => {
                 let name_parts = self.split_name(name, nr);
                 let key = name_parts.get(&0).unwrap().to_ascii();
 
-                let map = self.tokens.read().expect("ro lock failed");
-                let totp = map.get(&key);
+                let totp = self
+                    .store
+                    .lock_read(|s| s.kv_get::<String>(&self.store, "", key.clone()).unwrap())
+                    .unwrap();
 
                 match totp {
-                    Some(t) => {
+                    Some(s) => {
+                        let t = TOTP::new_unchecked(
+                            Algorithm::SHA1,
+                            6,
+                            1,
+                            30,
+                            Secret::Encoded(s).to_bytes().unwrap(),
+                        );
                         let token = t.generate_current().unwrap();
                         info!("Account: {} => Token: {}", key, token);
                         return Ok(token);
@@ -116,17 +127,9 @@ impl Handler {
                 let secret = name_parts.get(&0).unwrap().to_ascii();
                 let key = name_parts.get(&1).unwrap().to_ascii();
                 info!("add account: {} => {}", key, secret);
-                let totp = TOTP::new_unchecked(
-                    Algorithm::SHA1,
-                    6,
-                    1,
-                    30,
-                    Secret::Encoded(secret).to_bytes().unwrap(),
-                );
-                {
-                    let mut map = self.tokens.write().expect("rw lock failed");
-                    map.insert(key, totp);
-                }
+                _ = self.store.lock_write(|s| {
+                    s.kv_put(&self.store, "", key, &secret);
+                });
                 return Ok(String::from("added"));
             }
             _ => return Err(String::from("error")),
