@@ -2,9 +2,11 @@ use chrono::{Timelike, Utc};
 use microkv::{namespace::ExtendedIndexMap, MicroKV};
 use std::{collections::HashMap, path::PathBuf};
 
+use sha2::{Digest, Sha512};
+
 use tokio::net::UdpSocket;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 use trust_dns_server::{
     authority::MessageResponseBuilder,
     client::rr::{Label, LowerName, Name},
@@ -86,16 +88,30 @@ impl Handler {
             return Err(String::from("wildcard"));
         }
 
-        if !self.query_zone.zone_of(&LowerName::from(name)) {
-            return Err(String::from("wrong zone"));
-        }
+        match LowerName::from(name) {
+            sub if self.new_zone.zone_of(&sub)
+                && self.new_zone.num_labels() != name.num_labels() =>
+            {
+                let name_parts =
+                    self.split_name(&name.trim_to((self.new_zone.num_labels() + 1) as usize), 1);
+                let secret = name_parts.get(&0).unwrap().to_ascii();
+                let mut hasher = Sha512::new();
+                hasher.update(secret.as_bytes());
+                let key = String::from(format!("{:x}", hasher.finalize()).get(0..6).unwrap());
 
-        let nr_labels = (name.num_labels() - self.query_zone.num_labels()) as usize;
-
-        debug!("nr: {}", nr_labels);
-        match nr_labels {
-            nr if nr == 1 => {
-                let name_parts = self.split_name(name, nr);
+                info!("add account: {} => {}", key, secret);
+                _ = self.store.lock_write(|s| {
+                    s.kv_put(&self.store, "", key, &secret);
+                });
+                return Ok(String::from("added"));
+            }
+            sub if self.query_zone.zone_of(&sub)
+                && self.query_zone.num_labels() != name.num_labels() =>
+            {
+                let name_parts = self.split_name(
+                    &name.trim_to((self.query_zone.num_labels() + 1) as usize),
+                    1,
+                );
                 let key = name_parts.get(&0).unwrap().to_ascii();
 
                 let totp = self
@@ -122,17 +138,9 @@ impl Handler {
                     }
                 }
             }
-            nr if nr == 2 => {
-                let name_parts = self.split_name(name, nr);
-                let secret = name_parts.get(&0).unwrap().to_ascii();
-                let key = name_parts.get(&1).unwrap().to_ascii();
-                info!("add account: {} => {}", key, secret);
-                _ = self.store.lock_write(|s| {
-                    s.kv_put(&self.store, "", key, &secret);
-                });
-                return Ok(String::from("added"));
+            _ => {
+                return Err(String::from("wrong zone"));
             }
-            _ => return Err(String::from("error")),
         }
     }
 }
