@@ -1,6 +1,6 @@
 use chrono::{Timelike, Utc};
 use microkv::{namespace::ExtendedIndexMap, MicroKV};
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use sha2::{Digest, Sha512};
 
@@ -11,7 +11,7 @@ use trust_dns_server::{
     authority::MessageResponseBuilder,
     client::rr::{Label, LowerName, Name},
     proto::{
-        op::{Header, Query, ResponseCode},
+        op::{Header, ResponseCode},
         rr::{
             rdata::{SOA, TXT},
             RData, Record, RecordType,
@@ -38,9 +38,9 @@ impl Handler {
         }
     }
 
-    fn generate_txt(&self, txt: String, ttl: u32, query: &Name) -> Vec<Record> {
+    fn generate_txt(&self, txt: String, ttl: u32, query: &Name) -> Record {
         let rdata = RData::TXT(TXT::new(vec![txt]));
-        vec![Record::from_rdata(query.to_owned(), ttl, rdata)]
+        Record::from_rdata(query.to_owned(), ttl, rdata)
     }
 
     async fn handle_request_error<R: ResponseHandler>(
@@ -99,9 +99,25 @@ impl Handler {
 
                 info!("add account: {} => {}", key, secret);
                 _ = self.store.lock_write(|s| {
-                    s.kv_put(&self.store, "", key, &secret);
+                    s.kv_put(&self.store, "", key.clone(), &secret);
                 });
-                return Ok(self.generate_txt(String::from("added"), 3600, name));
+
+                let rdata = RData::CNAME(
+                    Name::from_str(key.as_str())
+                        .unwrap()
+                        .append_domain(&Name::from(self.query_zone.clone()))
+                        .unwrap(),
+                );
+                let records = vec![
+                    Record::from_rdata(query.name().into(), 3600, rdata),
+                    self.generate_txt(
+                        String::from("you can now query the CNAME for your TOTP"),
+                        3600,
+                        name,
+                    ),
+                ];
+
+                return Ok(records);
             }
             sub if self.query_zone == sub.base_name() => {
                 let name_parts = self.split_name(
@@ -130,7 +146,7 @@ impl Handler {
                         let now = Utc::now();
                         let ttl = 30 - now.second() % 30;
 
-                        return Ok(self.generate_txt(token, ttl, name));
+                        return Ok(vec![self.generate_txt(token, ttl, name)]);
                     }
                     None => {
                         error!("unknown account: {}", key);
