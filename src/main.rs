@@ -11,8 +11,11 @@ use trust_dns_server::{
     authority::MessageResponseBuilder,
     client::rr::{Label, LowerName, Name},
     proto::{
-        op::{Header, ResponseCode},
-        rr::{rdata::TXT, RData, Record},
+        op::{Header, Query, ResponseCode},
+        rr::{
+            rdata::{SOA, TXT},
+            RData, Record, RecordType,
+        },
     },
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     ServerFuture,
@@ -35,6 +38,11 @@ impl Handler {
         }
     }
 
+    fn generate_txt(&self, txt: String, ttl: u32, query: &Name) -> Vec<Record> {
+        let rdata = RData::TXT(TXT::new(vec![txt]));
+        vec![Record::from_rdata(query.to_owned(), ttl, rdata)]
+    }
+
     async fn handle_request_error<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -43,27 +51,19 @@ impl Handler {
         let response = MessageResponseBuilder::from_message_request(request);
 
         response_handle
-            .send_response(response.error_msg(request.header(), ResponseCode::ServFail))
+            .send_response(response.error_msg(request.header(), ResponseCode::Refused))
             .await
             .unwrap()
     }
-    async fn send_txt<R: ResponseHandler>(
+    async fn send_response<R: ResponseHandler>(
         &self,
-        txt: String,
+        records: Vec<Record>,
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
-        let rdata = RData::TXT(TXT::new(vec![txt]));
-        let now = Utc::now();
-        let ttl = 30 - now.second() % 30;
-        let records = vec![Record::from_rdata(
-            request.query().name().into(),
-            ttl,
-            rdata,
-        )];
         let response = builder.build(header, records.iter(), &[], &[], &[]);
         response_handle.send_response(response).await.unwrap()
     }
@@ -81,7 +81,7 @@ impl Handler {
             })
     }
 
-    fn do_handle_request(&self, request: &Request) -> Result<String, String> {
+    fn do_handle_request(&self, request: &Request) -> Result<Vec<Record>, String> {
         let query = request.query();
         let name = query.original().name();
         if name.is_wildcard() {
@@ -89,9 +89,7 @@ impl Handler {
         }
 
         match LowerName::from(name) {
-            sub if self.new_zone.zone_of(&sub)
-                && self.new_zone.num_labels() != name.num_labels() =>
-            {
+            sub if self.new_zone == sub.base_name() => {
                 let name_parts =
                     self.split_name(&name.trim_to((self.new_zone.num_labels() + 1) as usize), 1);
                 let secret = name_parts.get(&0).unwrap().to_ascii();
@@ -103,11 +101,9 @@ impl Handler {
                 _ = self.store.lock_write(|s| {
                     s.kv_put(&self.store, "", key, &secret);
                 });
-                return Ok(String::from("added"));
+                return Ok(self.generate_txt(String::from("added"), 3600, name));
             }
-            sub if self.query_zone.zone_of(&sub)
-                && self.query_zone.num_labels() != name.num_labels() =>
-            {
+            sub if self.query_zone == sub.base_name() => {
                 let name_parts = self.split_name(
                     &name.trim_to((self.query_zone.num_labels() + 1) as usize),
                     1,
@@ -130,13 +126,53 @@ impl Handler {
                         );
                         let token = t.generate_current().unwrap();
                         info!("Account: {} => Token: {}", key, token);
-                        return Ok(token);
+
+                        let now = Utc::now();
+                        let ttl = 30 - now.second() % 30;
+
+                        return Ok(self.generate_txt(token, ttl, name));
                     }
                     None => {
                         error!("unknown account: {}", key);
                         return Err(String::from("unknown account"));
                     }
                 }
+            }
+            sub if self.query_zone == sub => {
+                match query.query_type() {
+                    rt if RecordType::AAAA == rt => {
+                        error!("got AAAA");
+                    }
+                    rt if RecordType::A == rt => {
+                        error!("got A");
+                    }
+                    rt if RecordType::SOA == rt => {
+                        error!("got SOA");
+                        let rdata = RData::SOA(SOA::new(
+                            Name::from_ascii("dnsgames01.deebas.com").unwrap(),
+                            Name::from_ascii("dnsgames01.deebas.com").unwrap(),
+                            2023012704,
+                            10800,
+                            1800,
+                            604800,
+                            86400,
+                        ));
+                        let records = vec![Record::from_rdata(query.name().into(), 3600, rdata)];
+                        return Ok(records);
+                    }
+                    rt if RecordType::TXT == rt => {
+                        error!("got TXT");
+                    }
+                    rt if RecordType::NS == rt => {
+                        error!("got NS ");
+                        let rdata = RData::NS(Name::from_ascii("dnsgames01.deebas.com").unwrap());
+                        return Ok(vec![Record::from_rdata(query.name().into(), 3600, rdata)]);
+                    }
+                    _ => {
+                        error!("got something else");
+                    }
+                }
+                return Err(String::from("print help"));
             }
             _ => {
                 return Err(String::from("wrong zone"));
@@ -153,7 +189,7 @@ impl RequestHandler for Handler {
         response_handle: R,
     ) -> ResponseInfo {
         match self.do_handle_request(request) {
-            Ok(info) => self.send_txt(info, request, response_handle).await,
+            Ok(info) => self.send_response(info, request, response_handle).await,
             Err(msg) => {
                 error!("returned: {}", msg);
                 self.handle_request_error(request, response_handle).await
