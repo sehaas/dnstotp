@@ -1,0 +1,12 @@
+services:
+  dnstotp:
+    build: .
+    container_name: dnstotp
+    restart: unless-stopped
+    environment:
+      DNSTOTP_DB: /data
+      RUST_LOG: info
+    ports:
+      - 53:1053/udp
+    volumes:
+      - /docker/dnstotp/data:/data
