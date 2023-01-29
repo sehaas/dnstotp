@@ -1,8 +1,9 @@
 use chrono::{Timelike, Utc};
 use microkv::{namespace::ExtendedIndexMap, MicroKV};
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, net::Ipv4Addr, path::PathBuf, str::FromStr};
 
 use sha2::{Digest, Sha512};
+use std::env;
 
 use tokio::net::UdpSocket;
 use totp_rs::{Algorithm, Secret, TOTP};
@@ -29,17 +30,69 @@ struct Handler {
 
 impl Handler {
     pub fn new() -> Self {
+        let path = match env::var("DNSTOTP_DB") {
+            Ok(p) => p,
+            Err(_) => String::from("./"),
+        };
+
         Handler {
             query_zone: LowerName::from(Name::from_ascii("otp.deebas.com").unwrap()),
             new_zone: LowerName::from(Name::from_ascii("new.otp.deebas.com").unwrap()),
-            store: MicroKV::open_with_base_path("dnstotp-db", PathBuf::from("./"))
+            store: MicroKV::open_with_base_path("dnstotp-db", PathBuf::from(path))
                 .expect("no DB")
                 .set_auto_commit(true),
         }
     }
 
-    fn generate_txt(&self, txt: String, ttl: u32, query: &Name) -> Record {
-        let rdata = RData::TXT(TXT::new(vec![txt]));
+    fn generate_ipv4(&self, token: &str) -> Option<Ipv4Addr> {
+        let digits = token.as_bytes();
+
+        let pattern = [
+            [2, 1, 1, 2],
+            [1, 2, 2, 1],
+            [2, 2, 1, 1],
+            [1, 1, 2, 2],
+            [1, 2, 1, 2],
+            [2, 1, 2, 1],
+            [3, 1, 1, 1],
+            [1, 3, 1, 1],
+            [1, 1, 3, 1],
+            [1, 1, 1, 3],
+        ];
+
+        'pattern_loop: for p in pattern {
+            let mut result: [u8; 6] = [0; 6];
+            let mut r_idx = 0;
+            let mut bpo = 0;
+            for idx in 0..6 {
+                let c = result[r_idx]
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(digits[idx] - 48));
+                match c {
+                    Some(v) => result[r_idx] = v,
+                    None => {
+                        println!("ERR: invalid octet: {}, pattern: {:?}", token, p);
+                        continue 'pattern_loop;
+                    }
+                }
+                bpo = bpo + 1;
+                if bpo >= p[r_idx] {
+                    r_idx = r_idx + 1;
+                    bpo = 0;
+                }
+            }
+            let ipv4 = Ipv4Addr::new(result[0], result[1], result[2], result[3]);
+            let ipv4_str = ipv4.to_string();
+            if ipv4_str.len() == 9 {
+                return Some(ipv4);
+            }
+        }
+
+        None
+    }
+
+    fn generate_txt(&self, txt: &String, ttl: u32, query: &Name) -> Record {
+        let rdata = RData::TXT(TXT::new(vec![txt.clone()]));
         Record::from_rdata(query.to_owned(), ttl, rdata)
     }
 
@@ -111,7 +164,7 @@ impl Handler {
                 let records = vec![
                     Record::from_rdata(query.name().into(), 3600, rdata),
                     self.generate_txt(
-                        String::from("you can now query the CNAME for your TOTP"),
+                        &String::from("you can now query the CNAME for your TOTP"),
                         3600,
                         name,
                     ),
@@ -146,7 +199,16 @@ impl Handler {
                         let now = Utc::now();
                         let ttl = 30 - now.second() % 30;
 
-                        return Ok(vec![self.generate_txt(token, ttl, name)]);
+                        let mut records = vec![self.generate_txt(&token, ttl, name)];
+                        let r4 = self
+                            .generate_ipv4(&token.as_str())
+                            .and_then(|ipv4| Some(RData::A(ipv4)))
+                            .and_then(|r| Some(Record::from_rdata(query.name().into(), ttl, r)));
+                        match r4 {
+                            Some(r) => records.push(r),
+                            None => {}
+                        }
+                        return Ok(records);
                     }
                     None => {
                         error!("unknown account: {}", key);
@@ -177,7 +239,12 @@ impl Handler {
                         return Ok(records);
                     }
                     rt if RecordType::TXT == rt => {
-                        error!("got TXT");
+                        info!("got TXT");
+                        return Ok(vec![self.generate_txt(
+                            &String::from("missing key subdomain: <key>.otp.deebas.com"),
+                            3600,
+                            &query.name().into(),
+                        )]);
                     }
                     rt if RecordType::NS == rt => {
                         error!("got NS ");
