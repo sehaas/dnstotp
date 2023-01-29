@@ -155,16 +155,15 @@ impl Handler {
                     s.kv_put(&self.store, "", key.clone(), &secret);
                 });
 
-                let rdata = RData::CNAME(
-                    Name::from_str(key.as_str())
-                        .unwrap()
-                        .append_domain(&Name::from(self.query_zone.clone()))
-                        .unwrap(),
-                );
+                let cname = Name::from_str(key.as_str())
+                    .unwrap()
+                    .append_domain(&Name::from(self.query_zone.clone()))
+                    .unwrap();
+                let rdata = RData::CNAME(cname.clone());
                 let records = vec![
                     Record::from_rdata(query.name().into(), 3600, rdata),
                     self.generate_txt(
-                        &String::from("you can now query the CNAME for your TOTP"),
+                        &format!("you can now query {} for your TOTP", cname),
                         3600,
                         name,
                     ),
@@ -199,15 +198,13 @@ impl Handler {
                         let now = Utc::now();
                         let ttl = 30 - now.second() % 30;
 
-                        let mut records = vec![self.generate_txt(&token, ttl, name)];
-                        let r4 = self
+                        let ipv4 = self
                             .generate_ipv4(&token.as_str())
-                            .and_then(|ipv4| Some(RData::A(ipv4)))
-                            .and_then(|r| Some(Record::from_rdata(query.name().into(), ttl, r)));
-                        match r4 {
-                            Some(r) => records.push(r),
-                            None => {}
-                        }
+                            .unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0));
+                        let records = vec![
+                            Record::from_rdata(query.name().into(), ttl, RData::A(ipv4)),
+                            self.generate_txt(&token, ttl, name),
+                        ];
                         return Ok(records);
                     }
                     None => {
