@@ -39,7 +39,7 @@ struct Cli {
     #[arg(short, long, value_name = "NAMESERVER")]
     nameserver: Name,
 
-    #[arg(short, long, value_name = "SOCKET", default_value = "127.0.0.1:1053")]
+    #[arg(short, long, value_name = "SOCKET", default_value = "0.0.0.0:1053")]
     bind: SocketAddr,
 }
 

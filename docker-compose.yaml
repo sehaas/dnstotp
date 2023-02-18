@@ -8,6 +8,6 @@ services:
       DNSTOTP_NS: dnsgames01.deebas.com
       RUST_LOG: debug
     ports:
-      - 1053:1053/udp
+      - 53:1053/udp
     volumes:
-      - ./:/data
+      - /docker/dnstotp/data:/data
