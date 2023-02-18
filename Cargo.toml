@@ -2,12 +2,15 @@
 name = "dnstotp"
 version = "0.1.0"
 edition = "2021"
+authors = ["Sebastian Haas <sehaas@deebas.com>"]
+description = "DNS TOTP Service"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 async-trait = "0.1.63"
 chrono = "0.4.23"
+clap = { version = "4.1.6", features = ["derive"] }
 env_logger = "0.10.0"
 log = "0.4.17"
 microkv = "0.2.9"

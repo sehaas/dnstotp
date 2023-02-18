@@ -4,9 +4,10 @@ services:
     container_name: dnstotp
     restart: unless-stopped
     environment:
-      DNSTOTP_DB: /data
-      RUST_LOG: info
+      DNSTOTP_ZONE: otp.deebas.com
+      DNSTOTP_NS: dnsgames01.deebas.com
+      RUST_LOG: debug
     ports:
-      - 53:1053/udp
+      - 1053:1053/udp
     volumes:
-      - /docker/dnstotp/data:/data
+      - ./:/data

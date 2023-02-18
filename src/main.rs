@@ -1,13 +1,18 @@
 use chrono::{Timelike, Utc};
 use microkv::{namespace::ExtendedIndexMap, MicroKV};
-use std::{collections::HashMap, net::Ipv4Addr, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    str::FromStr,
+};
 
+use clap::Parser;
 use sha2::{Digest, Sha512};
-use std::env;
 
 use tokio::net::UdpSocket;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 use trust_dns_server::{
     authority::MessageResponseBuilder,
     client::rr::{Label, LowerName, Name},
@@ -22,23 +27,41 @@ use trust_dns_server::{
     ServerFuture,
 };
 
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long, value_name = "DIR", default_value = "./")]
+    database: String,
+
+    #[arg(short = 'z', long, value_name = "ZONE")]
+    dns_zone: Name,
+
+    #[arg(short, long, value_name = "NAMESERVER")]
+    nameserver: Name,
+
+    #[arg(short, long, value_name = "SOCKET", default_value = "127.0.0.1:1053")]
+    bind: SocketAddr,
+}
+
 struct Handler {
     query_zone: LowerName,
     new_zone: LowerName,
+    name_server: Name,
     store: MicroKV,
 }
 
 impl Handler {
-    pub fn new() -> Self {
-        let path = match env::var("DNSTOTP_DB") {
-            Ok(p) => p,
-            Err(_) => String::from("./"),
-        };
-
+    pub fn new(cli: &Cli) -> Self {
         Handler {
-            query_zone: LowerName::from(Name::from_ascii("otp.deebas.com").unwrap()),
-            new_zone: LowerName::from(Name::from_ascii("new.otp.deebas.com").unwrap()),
-            store: MicroKV::open_with_base_path("dnstotp-db", PathBuf::from(path))
+            query_zone: LowerName::from(cli.dns_zone.clone()),
+            new_zone: LowerName::from(
+                Name::from_ascii("new")
+                    .unwrap()
+                    .append_name(&cli.dns_zone)
+                    .unwrap(),
+            ),
+            name_server: cli.nameserver.clone(),
+            store: MicroKV::open_with_base_path("dnstotp-db", PathBuf::from(&cli.database))
                 .expect("no DB")
                 .set_auto_commit(true),
         }
@@ -71,7 +94,7 @@ impl Handler {
                 match c {
                     Some(v) => result[r_idx] = v,
                     None => {
-                        println!("ERR: invalid octet: {}, pattern: {:?}", token, p);
+                        error!("ERR: invalid octet: {}, pattern: {:?}", token, p);
                         continue 'pattern_loop;
                     }
                 }
@@ -216,16 +239,16 @@ impl Handler {
             sub if self.query_zone == sub => {
                 match query.query_type() {
                     rt if RecordType::AAAA == rt => {
-                        error!("got AAAA");
+                        debug!("got AAAA");
                     }
                     rt if RecordType::A == rt => {
-                        error!("got A");
+                        debug!("got A");
                     }
                     rt if RecordType::SOA == rt => {
-                        error!("got SOA");
+                        info!("got SOA");
                         let rdata = RData::SOA(SOA::new(
-                            Name::from_ascii("dnsgames01.deebas.com").unwrap(),
-                            Name::from_ascii("dnsgames01.deebas.com").unwrap(),
+                            self.name_server.clone(),
+                            self.name_server.clone(),
                             2023012704,
                             10800,
                             1800,
@@ -236,23 +259,30 @@ impl Handler {
                         return Ok(records);
                     }
                     rt if RecordType::TXT == rt => {
-                        info!("got TXT");
-                        return Ok(vec![self.generate_txt(
-                            &String::from("missing key subdomain: <key>.otp.deebas.com"),
-                            3600,
-                            &query.name().into(),
-                        )]);
+                        debug!("got TXT");
                     }
                     rt if RecordType::NS == rt => {
-                        error!("got NS ");
-                        let rdata = RData::NS(Name::from_ascii("dnsgames01.deebas.com").unwrap());
+                        info!("got NS");
+                        let rdata = RData::NS(self.name_server.clone());
                         return Ok(vec![Record::from_rdata(query.name().into(), 3600, rdata)]);
                     }
-                    _ => {
-                        error!("got something else");
+                    rt => {
+                        debug!("got something else: {}", rt);
                     }
                 }
-                return Err(String::from("print help"));
+                return Ok(vec![
+                    self.generate_txt(&format!("USAGE:"), 3600, &query.name().into()),
+                    self.generate_txt(
+                        &format!("  register: dig <secret>.{}", self.new_zone),
+                        3600,
+                        &query.name().into(),
+                    ),
+                    self.generate_txt(
+                        &format!("  query: dig <key>.{}", self.query_zone),
+                        3600,
+                        &query.name().into(),
+                    ),
+                ]);
             }
             _ => {
                 return Err(String::from("wrong zone"));
@@ -282,8 +312,11 @@ impl RequestHandler for Handler {
 pub async fn main() {
     tracing_subscriber::fmt::init();
 
-    let catalog = Handler::new();
+    let cli = Cli::parse();
+    debug!("CLI: {:?}", cli);
+
+    let catalog = Handler::new(&cli);
     let mut server = ServerFuture::new(catalog);
-    server.register_socket(UdpSocket::bind("0.0.0.0:1053").await.unwrap());
+    server.register_socket(UdpSocket::bind(cli.bind).await.unwrap());
     server.block_until_done().await.unwrap();
 }
